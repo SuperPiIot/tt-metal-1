@@ -15,6 +15,8 @@ import numpy as np
 import pytest
 import torch
 
+from dcp_oracle import Loader
+
 import ttml
 from ttml.common.schedulers import CosineAnnealingScheduler
 from ttml.distributed_checkpointing._errors import CheckpointError
@@ -44,20 +46,6 @@ class _Opt:
 
     def set_group_lrs(self, lrs):
         self._lrs = list(lrs)
-
-
-class _Loader:
-    def __init__(self) -> None:
-        self.position = 0
-
-    def advance(self) -> None:
-        self.position += 1
-
-    def get_state_dict(self) -> dict:
-        return {"position": self.position}
-
-    def set_state_dict(self, state: dict) -> None:
-        self.position = int(state["position"])
 
 
 def test_every_generator_comes_back_exactly():
@@ -103,7 +91,7 @@ def test_a_rank_restores_only_its_own_entry():
 def test_scheduler_and_dataloader_round_trip_through_the_header(tmp_path):
     opt = _Opt([1e-3, 2e-3])
     sched = CosineAnnealingScheduler(opt, T_max=10)
-    loader = _Loader()
+    loader = Loader()
     for _ in range(3):
         sched.step()
         loader.advance()
@@ -115,9 +103,9 @@ def test_scheduler_and_dataloader_round_trip_through_the_header(tmp_path):
 
     opt2 = _Opt([1e-3, 2e-3])
     sched2 = CosineAnnealingScheduler(opt2, T_max=10)
-    loader2 = _Loader()
+    loader2 = Loader()
     assert missing_train_state(back, scheduler=sched2, dataloader=loader2, rng=True) == ["train_state/rng"]
-    assert restore_train_state(back, scheduler=sched2, dataloader=loader2, rng=True) == ["dataloader", "scheduler"]
+    assert restore_train_state(back, scheduler=sched2, dataloader=loader2, rng=True) == ["scheduler", "dataloader"]
     assert sched2.get_last_lrs() == sched.get_last_lrs() and opt2.get_group_lrs() == opt.get_group_lrs()
     sched.step()
     sched2.step()
@@ -132,5 +120,51 @@ def test_state_that_is_not_json_is_refused(expect_error):
         def get_state_dict(self):
             return {"position": np.int64(3)}
 
-    with expect_error(CheckpointError, "dataloader state is not JSON"):
+    with expect_error(CheckpointError, "dataloader state at /position: a int64 has no JSON form"):
         capture_train_state(dataloader=_Bad(), rng=False)
+
+
+class _RefusingScheduler:
+    def get_state_dict(self) -> dict:
+        return {}
+
+    def set_state_dict(self, state: dict) -> None:
+        raise KeyError("m_step_size")  # what a StepScheduler raises for a cosine scheduler's state
+
+
+def test_a_refused_state_stops_the_restore_before_anything_else_moves(expect_error):
+    loader = Loader()
+    stored = {"scheduler": {"m_last_step": 3}, "dataloader": {"position": 5}}
+    with expect_error(CheckpointError, "the live scheduler refused the stored scheduler state"):
+        restore_train_state(stored, scheduler=_RefusingScheduler(), dataloader=loader)
+    assert loader.position == 0, "the scheduler is restored first, so the loader has not moved"
+
+
+def test_rng_state_is_checked_whole_before_any_generator_is_set(expect_error):
+    from ttml.distributed_checkpointing._errors import VersionError
+    from ttml.distributed_checkpointing._train_state import check_train_state
+
+    random.seed(21)
+    block = capture_rng(world_rank=0)
+    before = random.getstate()
+    broken = json.loads(json.dumps(block))
+    broken["ranks"]["0"]["numpy"]["state"] = "not hex"
+    with expect_error(CheckpointError, "the stored RNG state is malformed"):
+        check_train_state({"rng": broken}, rng=True, world_rank=0)
+    with expect_error(CheckpointError, "the stored RNG state is malformed"):
+        restore_rng(broken, world_rank=0)
+    assert random.getstate() == before, "python's generator was not set before numpy's failed to decode"
+    newer = dict(block, format=2)
+    with expect_error(VersionError, "newer than this reader"):
+        check_train_state({"rng": newer}, rng=True, world_rank=0)
+    check_train_state({"rng": block}, rng=False)  # not asked for: nothing to check
+
+
+class _IntKeyLoader(Loader):
+    def get_state_dict(self) -> dict:
+        return {"per_shard": {0: 7}}
+
+
+def test_state_that_would_not_read_back_as_written_is_refused(expect_error):
+    with expect_error(CheckpointError, "dataloader state at /per_shard: key 0 is a int"):
+        capture_train_state(dataloader=_IntKeyLoader(), rng=False)
