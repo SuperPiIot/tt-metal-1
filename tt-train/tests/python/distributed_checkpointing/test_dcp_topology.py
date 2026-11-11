@@ -4,8 +4,9 @@
 
 """From a topology label to chunk boxes, replica groups and owners, for N-D and collapsed labels alike."""
 
+import numpy as np
 
-from ttml.distributed_checkpointing._boxes import Box
+from ttml.distributed_checkpointing._boxes import Box, boxes_tile, grid_cell_size
 from ttml.distributed_checkpointing._errors import TopologyError
 from ttml.distributed_checkpointing._topology import (
     Label,
@@ -105,3 +106,42 @@ def test_negative_dims_are_normalized_and_bad_labels_rejected(expect_error):
 def test_label_round_trips_through_json():
     label = _label([R(), S(2)], (2, 4))
     assert Label.from_json(label.to_json()) == label
+
+
+def _pairwise_tile(boxes, target) -> bool:
+    """The definition boxes_tile implements: inside the target, no two overlapping, volumes adding up."""
+    boxes = [b for b in boxes if not b.is_empty()]
+    if any(not target.contains(b) for b in boxes) or sum(b.volume for b in boxes) != target.volume:
+        return False
+    return all(a.intersect(b) is None for i, a in enumerate(boxes) for b in boxes[i + 1 :])
+
+
+def test_boxes_of_different_ranks_name_both_ranks_when_intersected(expect_error):
+    with expect_error(ValueError, "cannot intersect a 2-d box with a 3-d box"):
+        Box((0, 0), (2, 2)).intersect(Box((0, 0, 0), (2, 2, 2)))
+
+
+def test_boxes_tile_grid_fast_path_agrees_with_the_pairwise_definition():
+    rng = np.random.default_rng(7)
+    grid_cases = 0
+    for _ in range(3000):
+        ndim = int(rng.integers(1, 4))
+        cell = tuple(int(rng.integers(1, 4)) for _ in range(ndim))
+        counts = tuple(int(rng.integers(1, 4)) for _ in range(ndim))
+        target = Box((0,) * ndim, tuple(c * n for c, n in zip(cell, counts)))
+        boxes = [
+            Box(tuple(i * c for i, c in zip(idx, cell)), cell) for idx in np.ndindex(*counts)
+        ]  # a full, exact grid
+        mutation = int(rng.integers(0, 5))
+        if mutation == 1 and len(boxes) > 1:
+            boxes[int(rng.integers(len(boxes)))] = boxes[0]  # a duplicate cell and a gap: same volume
+        elif mutation == 2:
+            boxes.pop(int(rng.integers(len(boxes))))  # a gap
+        elif mutation == 3:
+            b = boxes[int(rng.integers(len(boxes)))]
+            boxes.append(b.with_dim(0, b.offsets[0] + 1, max(1, b.sizes[0] - 1)))  # off-grid: pairwise path
+        elif mutation == 4:
+            boxes = [b.translate((1,) + (0,) * (ndim - 1)) for b in boxes]  # shifted past the target
+        grid_cases += grid_cell_size([b for b in boxes if not b.is_empty()], target.offsets) is not None
+        assert boxes_tile(boxes, target) == _pairwise_tile(boxes, target), (boxes, target)
+    assert grid_cases > 1000, "the fast path was exercised"
