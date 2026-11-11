@@ -111,7 +111,9 @@ def _python_parameters(model, params) -> tuple[dict[int, list[str]], dict[int, d
     names: dict[int, list[str]] = {}
     declarations: dict[int, dict] = {}
     for path, module in model.named_modules():
-        for attr, value in vars(module).items():
+        # A C++-bound child module has no Python attributes (and no __dict__); its parameters still reach the
+        # checkpoint through model.parameters(), just without Python declarations.
+        for attr, value in getattr(module, "__dict__", {}).items():
             if not isinstance(value, Parameter):
                 continue
             if value.is_lazy:
@@ -127,15 +129,23 @@ def _python_parameters(model, params) -> tuple[dict[int, list[str]], dict[int, d
     return names, declarations
 
 
-def _lint_fusion(key: str, label: Label, declaration: dict) -> None:
-    """A TP-sharded weight that looks fused by name but declares no segments loads silently wrong across TP sizes."""
-    if "fused" in declaration or label.shard_count(2) <= 1:
+def _lint_fusion(key: str, label: Label, declaration: dict, tensor: Any = None) -> None:
+    """A TP-sharded weight that looks fused by name but declares no segments loads silently wrong across TP sizes.
+
+    Only axes other than the parameter's own FSDP axis count: FSDP splits rows that are already in canonical order,
+    so an FSDP-only model's fused-looking weights are fine."""
+    if "fused" in declaration:
+        return
+    fsdp_axis = getattr(tensor, "_fsdp_axis", None) if getattr(tensor, "_fsdp_managed", False) else None
+    axes = [a for a in label.shard_axes(2) if a != fsdp_axis]
+    shards = int(np.prod([label.dist_shape[a] for a in axes])) if axes else 1
+    if shards <= 1:
         return
     module_name = key.rsplit("/", 2)[-2] if key.count("/") >= 2 else key
     if _FUSION_HINT.search(module_name):
         warnings.warn(
-            f"{key} is sharded on dim 2 across {label.shard_count(2)} devices and its name suggests a fused projection, "
-            f"but it declares no fused_segments; a checkpoint of it reshards correctly only between equal TP sizes",
+            f"{key} is sharded on dim 2 across {shards} devices and its name suggests a fused projection, but it "
+            f"declares no fused_segments; a checkpoint of it reshards correctly only between equal TP sizes",
             stacklevel=3,
         )
 
@@ -158,7 +168,7 @@ def collect_model(model) -> list[LiveTensor]:
             logical_extent=declaration.get("logical_extent"),
             key=key,
         )
-        _lint_fusion(key, label, declaration)
+        _lint_fusion(key, label, declaration, tensor)
         live_keys = tuple(sorted({key, *(f"model/{n}" for n in names.get(id(tensor), []))}))
         info = TensorInfo(key, "param", dtype_name(value), layout_name(value), label, local_shape, transform, live_keys)
         live.append(LiveTensor(key, tensor, info, declaration))
@@ -222,6 +232,33 @@ def collect_optimizer(optimizer, params: list[LiveTensor]) -> tuple[list[LiveTen
 
     walk(optimizer.get_state_dict(), ())
     return live, scalars
+
+
+def check_param_groups(optimizer, scalars: dict[str, Any]) -> None:
+    """The checkpoint's param groups must be the live optimizer's: the same count and, group by group, the same
+    params. Checked before any tensor is placed, so a mismatch leaves the model and optimizer untouched instead of
+    surfacing from ``set_state_dict`` after every tensor was replaced. A checkpoint without optimizer scalars (a
+    model-only save loaded non-strictly) has nothing to check."""
+    saved_count = scalars.get("optimizer/num_param_groups")
+    if saved_count is None:
+        return
+    state = optimizer.get_state_dict()
+    live_count = state.get("num_param_groups")
+    if live_count is not None and int(saved_count) != int(live_count):
+        raise CheckpointError(
+            f"the checkpoint has {saved_count} optimizer param groups, the live optimizer {live_count}"
+        )
+    for group in range(int(saved_count)):
+        name = f"param_groups.{group}.params"
+        saved, live_members = scalars.get("optimizer/" + name), state.get(name)
+        if saved is None or live_members is None or saved == live_members:
+            continue
+        saved_set, live_set = set(saved.split("\n")), set(live_members.split("\n"))
+        raise CheckpointError(
+            f"optimizer param group {group} holds different params in the checkpoint: only saved "
+            f"{sorted(saved_set - live_set)[:3]}, only live {sorted(live_set - saved_set)[:3]}; build the optimizer with "
+            f"the same param groups"
+        )
 
 
 def restore_scalars(optimizer, scalars: dict[str, Any]) -> list[str]:

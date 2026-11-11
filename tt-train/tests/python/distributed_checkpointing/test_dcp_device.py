@@ -13,6 +13,7 @@ device of its own.
 groups must not interleave: the TP tests come first, the FSDP test last.
 """
 
+import numpy as np
 import pytest
 import torch
 import ttnn
@@ -178,6 +179,81 @@ def test_incomplete_directory_and_existing_directory_are_refused(tp_mesh, tmp_pa
         dcp.save(path, model=model)
     dcp.save(path, model=model, overwrite=True)
     assert dcp.is_complete(path)
+
+
+class _LoraQKV(AbstractModuleBase):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        from ttml.modules import ColumnParallelLinear
+        from ttml.modules.lora import LoraColumnParallelLinear, LoraConfig
+
+        base = ColumnParallelLinear(dim, 2 * dim, has_bias=False, fused_segments=(dim, dim // 2, dim // 2))
+        self.qkv_linear = LoraColumnParallelLinear(base, LoraConfig(rank=8))
+
+    def forward(self, x):
+        return self.qkv_linear(x)
+
+
+def test_lora_on_a_fused_layer_declares_the_rows_it_adds_to(tp_mesh, expect_error):
+    from ttml.distributed_checkpointing._layouts import fused_segments
+    from ttml.distributed_checkpointing._state_dict import collect_model
+    from ttml.modules import ColumnParallelLinear
+
+    infos = {lt.key.rsplit("/", 1)[-1]: lt.info for lt in collect_model(_LoraQKV(DIM))}
+    segments = (DIM, DIM // 2, DIM // 2)
+    assert infos["weight"].transform == fused_segments(2, segments, 2)
+    assert infos["lora_B"].transform == fused_segments(2, segments, 2), "lora_B follows the base's per-shard rows"
+    # A segment that does not split evenly over the TP shards is refused when the layer is built, not at the first save.
+    with expect_error(ValueError, "must each divide"):
+        ColumnParallelLinear(DIM, 96, has_bias=False, fused_segments=(63, 33))
+
+
+def test_save_refuses_bad_state_before_writing_and_leaks_nothing(tp_mesh, tmp_path, monkeypatch, expect_error):
+    import os
+
+    from ttml.distributed_checkpointing import _save
+
+    model, params, opt = fresh_tp(DIM)
+    train_step(model, opt, DIM)
+    with expect_error(dcp.CheckpointError, r"header at /step: a int64 has no JSON form"):
+        dcp.save(str(tmp_path / "bad_header"), model=model, optimizer=opt, header={"step": np.int64(3)})
+    assert os.listdir(tmp_path) == [], "refused before any staging directory existed"
+
+    # A data file that cannot be created mid-way: the save fails, and every descriptor it opened is closed.
+    open_fds = len(os.listdir("/proc/self/fd"))
+    real_create = _save.create_file
+    calls = []
+
+    def failing_create(path, header, data_bytes):
+        calls.append(path)
+        if len(calls) == 2:
+            raise OSError("simulated EDQUOT")
+        return real_create(path, header, data_bytes)
+
+    monkeypatch.setattr(_save, "create_file", failing_create)
+    with expect_error(OSError, "simulated EDQUOT"):
+        dcp.save(str(tmp_path / "quota"), model=model, optimizer=opt)
+    monkeypatch.setattr(_save, "create_file", real_create)
+    assert len(os.listdir("/proc/self/fd")) == open_fds
+    assert os.listdir(tmp_path) == [], "the staging directory is removed"
+
+
+def test_a_truncated_data_file_is_refused_before_anything_is_placed(tp_mesh, tmp_path, expect_error):
+    import glob
+    import os
+
+    model, params, opt = fresh_tp(DIM)
+    train_step(model, opt, DIM)
+    path = str(tmp_path / dcp.step_dir_name(1))
+    dcp.save(path, model=model, optimizer=opt)
+    victim = sorted(glob.glob(os.path.join(path, "data", "*.safetensors")))[0]
+    os.truncate(victim, os.path.getsize(victim) - 1)
+
+    model2, params2, opt2 = fresh_tp(DIM)
+    before = _model_shards(params2)
+    with expect_error(dcp.IncompleteCheckpoint, "truncated or corrupt"):
+        dcp.load(path, model=model2, optimizer=opt2)
+    _assert_same_shards(_model_shards(params2), before)
 
 
 def test_fsdp_round_trip_and_the_sharded_state_gate(fsdp_mesh, tmp_path):
