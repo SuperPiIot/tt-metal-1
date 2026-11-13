@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
+import re
 import torch
 import math
 
@@ -12,7 +13,14 @@ from tt_py_test_utils_common.perf.benchmarking_utils import BenchmarkProfiler
 from tracy import signpost
 
 from tests.ttnn.utils_for_testing import assert_equal, assert_allclose, assert_with_pcc, assert_with_ulp
-from tt_py_test_utils_common.utility_functions import skip_for_slow_dispatch, run_for_blackhole
+from tests.ttnn.unit_tests.operations.data_movement.docstring_support import (
+    check_readable,
+    docstring_dtype_layout_params,
+    docstring_interleaved_buffer_type_params,
+    interleaved_memory_config,
+)
+from tests.ttnn.unit_tests.operations.data_movement.data_movement_test_utils import assert_exact, full_range_input
+from tt_py_test_utils_common.utility_functions import skip_for_slow_dispatch, run_for_blackhole, is_blackhole
 
 shapes = [[[1, 1, 32, 32]], [[3, 1, 320, 384]], [[1, 1, 128, 7328]]]
 
@@ -1286,3 +1294,54 @@ def test_tilize_uint8_tall_narrow_program_cache_addr_change(device, shape):
 
     assert entries == 1, "tilize should build exactly one program for a fixed config"
     device.disable_and_clear_program_cache()
+
+
+def _docstring_blackhole_rule():
+    """The dtypes the ttnn.tilize docstring's Blackhole sentence names, and the smallest tile height it allows them."""
+    sentence = next((part for part in ttnn.tilize.__doc__.split(".") if "On Blackhole" in part), "")
+    dtypes = {getattr(ttnn.DataType, name) for name in re.findall(r"``(\w+)``", sentence)}
+    min_height = re.search(r"tile height of (\d+) or more", sentence)
+    return dtypes, int(min_height.group(1)) if min_height else 1
+
+
+def _docstring_tile_heights():
+    """The tile heights the ``tile`` line of the ttnn.tilize docstring lists."""
+    line = next(line for line in ttnn.tilize.__doc__.splitlines() if line.strip().startswith("tile ("))
+    return [int(height) for height in re.findall(r"\d+", line.split("height of", 1)[1].split(".", 1)[0])]
+
+
+@pytest.mark.parametrize("buffer_type", docstring_interleaved_buffer_type_params(ttnn.tilize))
+@pytest.mark.parametrize("dtype, layout", docstring_dtype_layout_params(ttnn.tilize))
+@pytest.mark.parametrize("shape", [(2, 3, 64, 96), (1, 1, 64, 2048)], ids=["default", "wide"])
+def test_tilize_docstring_supported_inputs(shape, dtype, layout, buffer_type, device):
+    """Runs every dtype, layout and interleaved buffer type the ttnn.tilize docstring lists, with each tile height its
+    ``tile`` line lists.
+
+    BFLOAT16 inputs leave out NaN, as the docstring requires, and compare zeros by value. On Blackhole, the dtypes the
+    docstring's Blackhole sentence names run only from DRAM and with the tile heights it allows.
+    """
+    check_readable(dtype, layout, buffer_type)
+    blackhole_dtypes, blackhole_min_height = _docstring_blackhole_rule()
+    blackhole_rule = is_blackhole() and dtype in blackhole_dtypes
+    if blackhole_rule and buffer_type != ttnn.BufferType.DRAM:
+        pytest.skip(f"the docstring asks for {dtype} inputs in DRAM on Blackhole")
+    memory_config = interleaved_memory_config(buffer_type)
+    input_tensor = ttnn.from_torch(
+        full_range_input(shape, dtype, nan=dtype != ttnn.bfloat16),
+        dtype=dtype,
+        layout=layout,
+        device=device,
+        memory_config=memory_config,
+    )
+    tile_heights = _docstring_tile_heights()
+    assert 32 in tile_heights
+    if blackhole_rule:
+        tile_heights = [height for height in tile_heights if height >= blackhole_min_height]
+    for tile_height in tile_heights:
+        output = ttnn.tilize(input_tensor, tile=ttnn.Tile((tile_height, 32)))
+
+        assert output.layout == ttnn.TILE_LAYOUT
+        assert output.dtype == dtype
+        assert list(output.tile.tile_shape) == [tile_height, 32]
+        assert output.memory_config() == memory_config
+        assert_exact(ttnn.to_torch(input_tensor), ttnn.to_torch(output), signed_zeros=dtype != ttnn.bfloat16)
