@@ -1,6 +1,6 @@
 # ProgramSpec to Program
 
-This folder implements `MakeProgramFromSpec` (and their counterparts).
+This folder implements the `Program(MeshDevice&, const ProgramSpec&)` constructor (and their counterparts).
 These functions validate and builds `Program` from `ProgramSpec` from metal 2.0 host api.
 
 ## Pipeline
